@@ -287,23 +287,44 @@ app.get('/properties/:id', async (req, res) => {
     });
   }
 });
+
 // Validation schema for property search query parameters
 const searchPropertiesSchema = Joi.object({
   city: Joi.string().min(2).max(100),
   state: Joi.string().min(2).max(50),
   zip_code: Joi.string().pattern(/^\d{5}(-\d{4})?$/),
   min_rent: Joi.number().positive().max(50000),
-  max_rent: Joi.number().positive().max(50000).greater(Joi.ref('min_rent')),
+  max_rent: Joi.number().positive().max(50000),
   min_bedrooms: Joi.number().integer().min(0).max(20),
-  max_bedrooms: Joi.number().integer().min(0).max(20).min(Joi.ref('min_bedrooms')),
+  max_bedrooms: Joi.number().integer().min(0).max(20),
   min_bathrooms: Joi.number().positive().precision(1).max(20),
-  max_bathrooms: Joi.number().positive().precision(1).max(20).min(Joi.ref('min_bathrooms')),
+  max_bathrooms: Joi.number().positive().precision(1).max(20),
   min_sqft: Joi.number().integer().positive().max(50000),
-  max_sqft: Joi.number().integer().positive().max(50000).min(Joi.ref('min_sqft')),
+  max_sqft: Joi.number().integer().positive().max(50000),
   landlord_verified: Joi.boolean(),
   sort_by: Joi.string().valid('rent_asc', 'rent_desc', 'newest', 'oldest', 'sqft_asc', 'sqft_desc'),
   limit: Joi.number().integer().min(1).max(100).default(20),
   offset: Joi.number().integer().min(0).default(0)
+}).custom((value, helpers) => {
+  // Custom validation to ensure logical ranges
+  if (value.min_rent && value.max_rent && value.min_rent >= value.max_rent) {
+    return helpers.error('custom.rentRange');
+  }
+  if (value.min_bedrooms !== undefined && value.max_bedrooms !== undefined && value.min_bedrooms > value.max_bedrooms) {
+    return helpers.error('custom.bedroomsRange');
+  }
+  if (value.min_bathrooms && value.max_bathrooms && value.min_bathrooms > value.max_bathrooms) {
+    return helpers.error('custom.bathroomsRange');
+  }
+  if (value.min_sqft && value.max_sqft && value.min_sqft > value.max_sqft) {
+    return helpers.error('custom.sqftRange');
+  }
+  return value;
+}, 'Range validation').messages({
+  'custom.rentRange': 'min_rent must be less than max_rent',
+  'custom.bedroomsRange': 'min_bedrooms must be less than or equal to max_bedrooms',
+  'custom.bathroomsRange': 'min_bathrooms must be less than max_bathrooms',
+  'custom.sqftRange': 'min_sqft must be less than max_sqft'
 });
 
 // GET /properties - Search properties with filtering
