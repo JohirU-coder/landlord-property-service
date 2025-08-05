@@ -8,18 +8,17 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-// Database connection (same database as auth service)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Middleware
+
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
 
-// Health check
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
@@ -28,8 +27,6 @@ app.get('/health', (req, res) => {
     version: '1.0.0'
   });
 });
-
-// Root endpoint
 app.get('/', (req, res) => {
   res.json({
     message: 'Landlord Property Service API',
@@ -43,8 +40,6 @@ app.get('/', (req, res) => {
     }
   });
 });
-
-// Test endpoint
 app.get('/test', (req, res) => {
   res.json({
     message: 'Property service test endpoint working!',
@@ -53,7 +48,7 @@ app.get('/test', (req, res) => {
   });
 });
 
-// Create properties table
+
 app.get('/setup-database', async (req, res) => {
   try {
     await pool.query(`
@@ -92,4 +87,12 @@ app.get('/setup-database', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🏠 Property service running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+const Joi = require('joi');
+
+const createPropertySchema = Joi.object({
+
+app.post('/properties', async (req, res) => {
+
+app.get('/properties/:id', async (req, res) => {
 });
