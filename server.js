@@ -88,7 +88,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🏠 Property service running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
-const Joi = require('joi');
 
 const createPropertySchema = Joi.object({
 
