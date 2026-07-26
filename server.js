@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const Joi = require('joi');
 const { Pool } = require('pg');
+const { geocodeAddress, delay } = require('./geocode');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -59,6 +60,7 @@ app.get('/', (req, res) => {
       'setup-database': '/setup-database (GET)',
       'add-property': '/properties (POST)',
       'search-properties': '/properties (GET)',
+      'geocode-backfill': '/admin/geocode-properties (POST)',
       test: '/test'
     }
   });
@@ -74,6 +76,7 @@ app.get('/test', (req, res) => {
 
 app.get('/setup-database', async (req, res) => {
   try {
+    // Create properties table with latitude/longitude
     await pool.query(`
       CREATE TABLE IF NOT EXISTS properties (
         id SERIAL PRIMARY KEY,
@@ -81,6 +84,8 @@ app.get('/setup-database', async (req, res) => {
         city VARCHAR(100) NOT NULL,
         state VARCHAR(50) NOT NULL,
         zip_code VARCHAR(20) NOT NULL,
+        latitude DECIMAL(10, 8),
+        longitude DECIMAL(11, 8),
         rent_amount DECIMAL(10,2),
         bedrooms INTEGER,
         bathrooms DECIMAL(3,1),
@@ -91,6 +96,13 @@ app.get('/setup-database', async (req, res) => {
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
+    `);
+
+    // Add latitude/longitude columns if they don't exist (for existing tables)
+    await pool.query(`
+      ALTER TABLE properties 
+      ADD COLUMN IF NOT EXISTS latitude DECIMAL(10, 8),
+      ADD COLUMN IF NOT EXISTS longitude DECIMAL(11, 8);
     `);
     
     res.json({ 
@@ -167,12 +179,25 @@ app.post('/properties', async (req, res) => {
       });
     }
 
+    // Try to geocode (best-effort, doesn't block save)
+    let latitude = null;
+    let longitude = null;
+    try {
+      const geocodeResult = await geocodeAddress(address, city, state, zip_code);
+      if (geocodeResult.success) {
+        latitude = geocodeResult.latitude;
+        longitude = geocodeResult.longitude;
+      }
+    } catch (geocodeErr) {
+      console.warn('Geocoding failed for property, continuing without coords:', geocodeErr);
+    }
+
     // Insert the new property
     const insertQuery = `
       INSERT INTO properties (
-        address, city, state, zip_code, rent_amount, 
+        address, city, state, zip_code, latitude, longitude, rent_amount, 
         bedrooms, bathrooms, square_feet, description, landlord_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       RETURNING *
     `;
 
@@ -181,6 +206,8 @@ app.post('/properties', async (req, res) => {
       city,
       state,
       zip_code,
+      latitude,
+      longitude,
       rent_amount,
       bedrooms,
       bathrooms,
@@ -201,6 +228,8 @@ app.post('/properties', async (req, res) => {
         city: newProperty.city,
         state: newProperty.state,
         zip_code: newProperty.zip_code,
+        latitude: newProperty.latitude,
+        longitude: newProperty.longitude,
         rent_amount: newProperty.rent_amount,
         bedrooms: newProperty.bedrooms,
         bathrooms: newProperty.bathrooms,
@@ -273,6 +302,8 @@ app.get('/properties/:id', async (req, res) => {
         city: property.city,
         state: property.state,
         zip_code: property.zip_code,
+        latitude: property.latitude,
+        longitude: property.longitude,
         rent_amount: property.rent_amount,
         bedrooms: property.bedrooms,
         bathrooms: property.bathrooms,
@@ -491,6 +522,8 @@ app.get('/properties', async (req, res) => {
         p.city,
         p.state,
         p.zip_code,
+        p.latitude,
+        p.longitude,
         p.rent_amount,
         p.bedrooms,
         p.bathrooms,
@@ -534,6 +567,8 @@ app.get('/properties', async (req, res) => {
       city: property.city,
       state: property.state,
       zip_code: property.zip_code,
+      latitude: property.latitude,
+      longitude: property.longitude,
       rent_amount: property.rent_amount,
       bedrooms: property.bedrooms,
       bathrooms: property.bathrooms,
@@ -578,6 +613,83 @@ app.get('/properties', async (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Failed to search properties'
+    });
+  }
+});
+
+// POST /admin/geocode-properties - Backfill geocoding for properties without coordinates
+app.post('/admin/geocode-properties', async (req, res) => {
+  try {
+    const adminSecret = req.headers['admin-secret'] || req.body.admin_secret;
+    
+    if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Invalid or missing admin_secret'
+      });
+    }
+
+    // Get properties without coordinates (limit 100 per request)
+    const query = `
+      SELECT id, address, city, state, zip_code
+      FROM properties
+      WHERE latitude IS NULL OR longitude IS NULL
+      LIMIT 100
+    `;
+
+    const result = await pool.query(query);
+    const properties = result.rows;
+
+    let geocoded = 0;
+    let failed = 0;
+
+    // Geocode each property
+    for (const prop of properties) {
+      try {
+        const geocodeResult = await geocodeAddress(prop.address, prop.city, prop.state, prop.zip_code);
+        
+        if (geocodeResult.success) {
+          await pool.query(
+            'UPDATE properties SET latitude = $1, longitude = $2 WHERE id = $3',
+            [geocodeResult.latitude, geocodeResult.longitude, prop.id]
+          );
+          geocoded++;
+        } else {
+          failed++;
+        }
+
+        // Respect 1 req/sec rate limit
+        await delay(1100);
+      } catch (error) {
+        console.error(`Failed to geocode property ${prop.id}:`, error);
+        failed++;
+      }
+    }
+
+    // Count remaining properties without coordinates
+    const remainingResult = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM properties
+      WHERE latitude IS NULL OR longitude IS NULL
+    `);
+    const remaining = parseInt(remainingResult.rows[0].count);
+
+    res.json({
+      success: true,
+      message: 'Geocoding backfill complete',
+      geocoded,
+      failed,
+      processed: properties.length,
+      remaining,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Geocoding backfill error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Geocoding backfill failed',
+      details: error.message
     });
   }
 });
@@ -637,7 +749,9 @@ app.get('/properties/stats', async (req, res) => {
     });
   }
 });
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🏠 Property service running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
+
