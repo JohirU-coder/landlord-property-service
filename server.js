@@ -571,7 +571,14 @@ app.get('/properties', async (req, res) => {
         u.last_name as landlord_last_name,
         u.email as landlord_email,
         COUNT(r.id) as review_count,
-        AVG(r.overall_rating) as avg_rating
+        AVG(r.overall_rating) as avg_rating,
+        (
+          SELECT rp.filename FROM review_photos rp
+          JOIN reviews rv ON rv.id = rp.review_id
+          WHERE rv.property_id = p.id
+          ORDER BY rp.created_at DESC
+          LIMIT 1
+        ) as photo_filename
       FROM properties p
       JOIN users u ON p.landlord_id = u.id
       LEFT JOIN reviews r ON r.property_id = p.id
@@ -624,7 +631,11 @@ app.get('/properties', async (req, res) => {
       review_stats: {
         count: parseInt(property.review_count) || 0,
         avg_rating: property.avg_rating ? Math.round(parseFloat(property.avg_rating) * 10) / 10 : null
-      }
+      },
+      // Relative path on review-service's static /photos route — prefix with
+      // REVIEW_API_BASE_URL client-side (property-service doesn't know
+      // review-service's public URL).
+      photo_path: property.photo_filename ? `/photos/${property.photo_filename}` : null
     }));
 
     res.json({
