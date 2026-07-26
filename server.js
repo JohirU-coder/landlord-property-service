@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const Joi = require('joi');
 const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
 const { geocodeAddress, delay } = require('./geocode');
 
 const app = express();
@@ -14,7 +15,41 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Validation schema for property creation
+// JWT auth — matches auth-service's authMiddleware.js exactly (same JWT_SECRET,
+// same payload shape: { userId, email, role }). Property ownership is derived
+// from the token instead of trusting a client-supplied landlord_id.
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access denied', message: 'No token provided' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid token', message: 'Token is invalid or expired' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+const requireRole = (roles) => (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  if (!roles.includes(req.user.role)) {
+    return res.status(403).json({
+      error: 'Insufficient permissions',
+      message: `This endpoint requires ${roles.join(' or ')} role`
+    });
+  }
+  next();
+};
+
+// Validation schema for property creation — landlord_id is no longer accepted
+// from the client; it's derived from the authenticated user's token.
 const createPropertySchema = Joi.object({
   address: Joi.string().required().min(5).max(500),
   city: Joi.string().required().min(2).max(100),
@@ -24,8 +59,7 @@ const createPropertySchema = Joi.object({
   bedrooms: Joi.number().integer().min(0).max(20),
   bathrooms: Joi.number().positive().precision(1).max(20),
   square_feet: Joi.number().integer().positive().max(50000),
-  description: Joi.string().max(2000),
-  landlord_id: Joi.number().integer().required()
+  description: Joi.string().max(2000)
 });
 
 app.use(helmet());
@@ -119,8 +153,8 @@ app.get('/setup-database', async (req, res) => {
   }
 });
 
-// POST /properties - Create a new property
-app.post('/properties', async (req, res) => {
+// POST /properties - Create a new property (requires landlord auth)
+app.post('/properties', authenticateToken, requireRole(['landlord']), async (req, res) => {
   try {
     // Validate request body
     const { error, value } = createPropertySchema.validate(req.body);
@@ -140,9 +174,10 @@ app.post('/properties', async (req, res) => {
       bedrooms,
       bathrooms,
       square_feet,
-      description,
-      landlord_id
+      description
     } = value;
+
+    const landlord_id = req.user.userId;
 
     // Verify the landlord exists and is actually a landlord
     const landlordCheck = await pool.query(
@@ -533,10 +568,14 @@ app.get('/properties', async (req, res) => {
         p.created_at,
         u.first_name as landlord_first_name,
         u.last_name as landlord_last_name,
-        u.email as landlord_email
+        u.email as landlord_email,
+        COUNT(r.id) as review_count,
+        AVG(r.overall_rating) as avg_rating
       FROM properties p
       JOIN users u ON p.landlord_id = u.id
+      LEFT JOIN reviews r ON r.property_id = p.id
       ${whereClause}
+      GROUP BY p.id, u.id
       ${orderClause}
       LIMIT ${limitParam} OFFSET ${offsetParam}
     `;
@@ -580,6 +619,10 @@ app.get('/properties', async (req, res) => {
         first_name: property.landlord_first_name,
         last_name: property.landlord_last_name,
         email: property.landlord_email
+      },
+      review_stats: {
+        count: parseInt(property.review_count) || 0,
+        avg_rating: property.avg_rating ? Math.round(parseFloat(property.avg_rating) * 10) / 10 : null
       }
     }));
 
