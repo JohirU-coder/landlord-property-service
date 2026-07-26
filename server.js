@@ -15,9 +15,10 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// JWT auth — matches auth-service's authMiddleware.js exactly (same JWT_SECRET,
-// same payload shape: { userId, email, role }). Property ownership is derived
-// from the token instead of trusting a client-supplied landlord_id.
+// JWT auth — matches auth-service's generateToken() exactly (same JWT_SECRET,
+// same payload shape: { id, email, role, firstName, lastName, email_verified }).
+// Property ownership is derived from the token instead of trusting a
+// client-supplied landlord_id.
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
@@ -177,7 +178,7 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
       description
     } = value;
 
-    const landlord_id = req.user.userId;
+    const landlord_id = req.user.id;
 
     // Verify the landlord exists and is actually a landlord
     const landlordCheck = await pool.query(
