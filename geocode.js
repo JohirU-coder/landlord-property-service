@@ -3,69 +3,80 @@ const https = require('https');
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+function nominatimSearch(query) {
+  const encodedQuery = encodeURIComponent(query);
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodedQuery}&format=json&limit=1&addressdetails=1`;
+  const options = { headers: { 'User-Agent': 'RentReviews-Platform/1.0' } };
+
+  return new Promise((resolve) => {
+    https.get(url, options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const results = JSON.parse(data);
+          resolve(results && results.length > 0 ? results[0] : null);
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    }).on('error', (err) => {
+      console.error('Geocoding error:', err);
+      resolve(null);
+    });
+  });
+}
+
 async function geocodeAddress(address, city, state, zipCode) {
   try {
-    const fullAddress = `${address}, ${city}, ${state} ${zipCode}`;
-    const encodedAddress = encodeURIComponent(fullAddress);
-    
-    return new Promise((resolve, reject) => {
-      const url = `https://nominatim.openstreetmap.org/search?q=${encodedAddress}&format=json&limit=1`;
-      
-      const options = {
-        headers: {
-          'User-Agent': 'RentReviews-Platform/1.0'
-        }
-      };
-      
-      https.get(url, options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try {
-            const results = JSON.parse(data);
-            if (results && results.length > 0) {
-              resolve({
-                success: true,
-                latitude: parseFloat(results[0].lat),
-                longitude: parseFloat(results[0].lon)
-              });
-            } else {
-              resolve({
-                success: false,
-                latitude: null,
-                longitude: null,
-                reason: 'No results found'
-              });
-            }
-          } catch (e) {
-            resolve({
-              success: false,
-              latitude: null,
-              longitude: null,
-              reason: 'Parse error'
-            });
-          }
-        });
-      }).on('error', (err) => {
-        console.error('Geocoding error:', err);
-        resolve({
-          success: false,
-          latitude: null,
-          longitude: null,
-          reason: err.message
-        });
-      });
-    });
+    const fullAddress = [address, city, state, zipCode].filter(Boolean).join(', ');
+    const result = await nominatimSearch(fullAddress);
+
+    if (!result) {
+      return { success: false, latitude: null, longitude: null, reason: 'No results found' };
+    }
+
+    return {
+      success: true,
+      latitude: parseFloat(result.lat),
+      longitude: parseFloat(result.lon)
+    };
   } catch (error) {
     console.error('Geocode error:', error);
-    return {
-      success: false,
-      latitude: null,
-      longitude: null,
-      reason: error.message
-    };
+    return { success: false, latitude: null, longitude: null, reason: error.message };
   }
 }
 
-module.exports = { geocodeAddress, delay };
+// Free-text address lookup (e.g. "104 Coral Street, Miami, FL") — used when a
+// searched address isn't yet a property in our database. Returns Nominatim's
+// structured address components so the caller can populate address/city/
+// state/zip_code fields without the user re-typing them.
+async function geocodeFreeText(query) {
+  try {
+    const result = await nominatimSearch(query);
+    if (!result) {
+      return { success: false, reason: 'No results found' };
+    }
 
+    const addr = result.address || {};
+    const houseNumber = addr.house_number || '';
+    const road = addr.road || '';
+    const streetAddress = [houseNumber, road].filter(Boolean).join(' ') || result.display_name.split(',')[0];
+
+    return {
+      success: true,
+      latitude: parseFloat(result.lat),
+      longitude: parseFloat(result.lon),
+      display_name: result.display_name,
+      address: streetAddress,
+      city: addr.city || addr.town || addr.village || addr.hamlet || '',
+      state: addr.state || '',
+      zip_code: addr.postcode || ''
+    };
+  } catch (error) {
+    console.error('Geocode error:', error);
+    return { success: false, reason: error.message };
+  }
+}
+
+module.exports = { geocodeAddress, geocodeFreeText, delay };

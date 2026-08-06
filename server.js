@@ -5,7 +5,8 @@ const helmet = require('helmet');
 const Joi = require('joi');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
-const { geocodeAddress, delay } = require('./geocode');
+const { geocodeAddress, geocodeFreeText, delay } = require('./geocode');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -48,6 +49,31 @@ const requireRole = (roles) => (req, res, next) => {
   }
   next();
 };
+
+// Rate limits for the two endpoints unauthenticated/any-role traffic can
+// reach — geocoding hits a free third-party service, and community-submit
+// creates DB rows without landlord-role gating, so both need spam guards.
+const geocodeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: { error: 'Too many requests', message: 'Please slow down and try again shortly' }
+});
+
+const communitySubmitLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many requests', message: 'Maximum 10 property submissions per hour' }
+});
+
+// Validation schema for community-submitted properties — minimal fields,
+// no rent/bedroom details required since the submitter is a renter who
+// just wants to review an address, not a landlord listing it.
+const communityPropertySchema = Joi.object({
+  address: Joi.string().required().min(5).max(500),
+  city: Joi.string().required().min(2).max(100),
+  state: Joi.string().required().min(2).max(50),
+  zip_code: Joi.string().required().pattern(/^\d{5}(-\d{4})?$/)
+});
 
 // Validation schema for property creation — landlord_id is no longer accepted
 // from the client; it's derived from the authenticated user's token.
@@ -152,6 +178,77 @@ app.get('/setup-database', async (req, res) => {
       error: 'Failed to create properties table', 
       details: error.message 
     });
+  }
+});
+
+// GET /geocode - Free-text address lookup (PUBLIC, no DB write). Used by the
+// search page to preview an address (with a Street View image) before
+// anyone commits to adding it as a property.
+app.get('/geocode', geocodeLimiter, async (req, res) => {
+  const query = (req.query.q || '').trim();
+  if (!query) {
+    return res.status(400).json({ error: 'Missing query', message: 'q parameter is required' });
+  }
+
+  const result = await geocodeFreeText(query);
+  if (!result.success) {
+    return res.status(404).json({ error: 'Not found', message: 'Could not find that address' });
+  }
+
+  res.json({ success: true, ...result });
+});
+
+// POST /properties/community - Find-or-create a minimal, unverified property
+// record so a renter can review an address that isn't in our database yet.
+// Open to any authenticated user (not landlord-only) since the whole point
+// is letting renters review properties no landlord has listed.
+app.post('/properties/community', authenticateToken, communitySubmitLimiter, async (req, res) => {
+  try {
+    const { error, value } = communityPropertySchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: error.details.map(detail => detail.message)
+      });
+    }
+
+    const { address, city, state, zip_code } = value;
+
+    // Idempotent: if this address already exists (landlord-listed or
+    // previously community-submitted), just return it instead of duplicating.
+    const existing = await pool.query(
+      'SELECT * FROM properties WHERE LOWER(address) = LOWER($1) AND zip_code = $2',
+      [address, zip_code]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.json({ success: true, property: existing.rows[0], already_existed: true });
+    }
+
+    let latitude = null;
+    let longitude = null;
+    try {
+      const geocodeResult = await geocodeAddress(address, city, state, zip_code);
+      if (geocodeResult.success) {
+        latitude = geocodeResult.latitude;
+        longitude = geocodeResult.longitude;
+      }
+    } catch (geocodeErr) {
+      console.warn('Geocoding failed for community property, continuing without coords:', geocodeErr);
+    }
+
+    const result = await pool.query(
+      `INSERT INTO properties (address, city, state, zip_code, latitude, longitude, landlord_id, description)
+       VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)
+       RETURNING *`,
+      [address, city, state, zip_code, latitude, longitude,
+        '[Community-Submitted Property - Unverified by Landlord]']
+    );
+
+    res.status(201).json({ success: true, property: result.rows[0], already_existed: false });
+  } catch (error) {
+    console.error('Error creating community property:', error);
+    res.status(500).json({ error: 'Internal server error', message: 'Failed to add property' });
   }
 });
 
@@ -316,7 +413,7 @@ app.get('/properties/:id', async (req, res) => {
         u.last_name as landlord_last_name,
         u.email as landlord_email
       FROM properties p
-      JOIN users u ON p.landlord_id = u.id
+      LEFT JOIN users u ON p.landlord_id = u.id
       WHERE p.id = $1
     `;
 
@@ -581,7 +678,7 @@ app.get('/properties', async (req, res) => {
           LIMIT 1
         ) as photo_filename
       FROM properties p
-      JOIN users u ON p.landlord_id = u.id
+      LEFT JOIN users u ON p.landlord_id = u.id
       LEFT JOIN reviews r ON r.property_id = p.id
       ${whereClause}
       GROUP BY p.id, u.id
@@ -593,7 +690,7 @@ app.get('/properties', async (req, res) => {
     const countQuery = `
       SELECT COUNT(*) as total
       FROM properties p
-      JOIN users u ON p.landlord_id = u.id
+      LEFT JOIN users u ON p.landlord_id = u.id
       ${whereClause}
     `;
 
