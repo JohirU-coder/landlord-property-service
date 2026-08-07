@@ -6,6 +6,7 @@ const Joi = require('joi');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const { geocodeAddress, geocodeFreeText, delay } = require('./geocode');
+const { getStreetViewHeading } = require('./streetView');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -162,9 +163,10 @@ app.get('/setup-database', async (req, res) => {
 
     // Add latitude/longitude columns if they don't exist (for existing tables)
     await pool.query(`
-      ALTER TABLE properties 
+      ALTER TABLE properties
       ADD COLUMN IF NOT EXISTS latitude DECIMAL(10, 8),
-      ADD COLUMN IF NOT EXISTS longitude DECIMAL(11, 8);
+      ADD COLUMN IF NOT EXISTS longitude DECIMAL(11, 8),
+      ADD COLUMN IF NOT EXISTS street_view_heading DOUBLE PRECISION;
     `);
     
     res.json({ 
@@ -195,7 +197,8 @@ app.get('/geocode', geocodeLimiter, async (req, res) => {
     return res.status(404).json({ error: 'Not found', message: 'Could not find that address' });
   }
 
-  res.json({ success: true, ...result });
+  const streetViewHeading = await getStreetViewHeading(result.latitude, result.longitude);
+  res.json({ success: true, ...result, street_view_heading: streetViewHeading });
 });
 
 // POST /properties/community - Find-or-create a minimal, unverified property
@@ -227,21 +230,23 @@ app.post('/properties/community', authenticateToken, communitySubmitLimiter, asy
 
     let latitude = null;
     let longitude = null;
+    let streetViewHeading = null;
     try {
       const geocodeResult = await geocodeAddress(address, city, state, zip_code);
       if (geocodeResult.success) {
         latitude = geocodeResult.latitude;
         longitude = geocodeResult.longitude;
+        streetViewHeading = await getStreetViewHeading(latitude, longitude);
       }
     } catch (geocodeErr) {
       console.warn('Geocoding failed for community property, continuing without coords:', geocodeErr);
     }
 
     const result = await pool.query(
-      `INSERT INTO properties (address, city, state, zip_code, latitude, longitude, landlord_id, description)
-       VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)
+      `INSERT INTO properties (address, city, state, zip_code, latitude, longitude, street_view_heading, landlord_id, description)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)
        RETURNING *`,
-      [address, city, state, zip_code, latitude, longitude,
+      [address, city, state, zip_code, latitude, longitude, streetViewHeading,
         '[Community-Submitted Property - Unverified by Landlord]']
     );
 
@@ -316,11 +321,13 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
     // Try to geocode (best-effort, doesn't block save)
     let latitude = null;
     let longitude = null;
+    let streetViewHeading = null;
     try {
       const geocodeResult = await geocodeAddress(address, city, state, zip_code);
       if (geocodeResult.success) {
         latitude = geocodeResult.latitude;
         longitude = geocodeResult.longitude;
+        streetViewHeading = await getStreetViewHeading(latitude, longitude);
       }
     } catch (geocodeErr) {
       console.warn('Geocoding failed for property, continuing without coords:', geocodeErr);
@@ -329,9 +336,9 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
     // Insert the new property
     const insertQuery = `
       INSERT INTO properties (
-        address, city, state, zip_code, latitude, longitude, rent_amount, 
+        address, city, state, zip_code, latitude, longitude, street_view_heading, rent_amount,
         bedrooms, bathrooms, square_feet, description, landlord_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING *
     `;
 
@@ -342,6 +349,7 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
       zip_code,
       latitude,
       longitude,
+      streetViewHeading,
       rent_amount,
       bedrooms,
       bathrooms,
@@ -364,6 +372,7 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
         zip_code: newProperty.zip_code,
         latitude: newProperty.latitude,
         longitude: newProperty.longitude,
+        street_view_heading: newProperty.street_view_heading,
         rent_amount: newProperty.rent_amount,
         bedrooms: newProperty.bedrooms,
         bathrooms: newProperty.bathrooms,
@@ -438,6 +447,7 @@ app.get('/properties/:id', async (req, res) => {
         zip_code: property.zip_code,
         latitude: property.latitude,
         longitude: property.longitude,
+        street_view_heading: property.street_view_heading,
         rent_amount: property.rent_amount,
         bedrooms: property.bedrooms,
         bathrooms: property.bathrooms,
@@ -658,6 +668,7 @@ app.get('/properties', async (req, res) => {
         p.zip_code,
         p.latitude,
         p.longitude,
+        p.street_view_heading,
         p.rent_amount,
         p.bedrooms,
         p.bathrooms,
@@ -714,6 +725,7 @@ app.get('/properties', async (req, res) => {
       zip_code: property.zip_code,
       latitude: property.latitude,
       longitude: property.longitude,
+      street_view_heading: property.street_view_heading,
       rent_amount: property.rent_amount,
       bedrooms: property.bedrooms,
       bathrooms: property.bathrooms,
@@ -782,11 +794,12 @@ app.post('/admin/geocode-properties', async (req, res) => {
       });
     }
 
-    // Get properties without coordinates (limit 100 per request)
+    // Get properties missing coordinates and/or a Street View heading
+    // (limit 100 per request)
     const query = `
-      SELECT id, address, city, state, zip_code
+      SELECT id, address, city, state, zip_code, latitude, longitude, street_view_heading
       FROM properties
-      WHERE latitude IS NULL OR longitude IS NULL
+      WHERE latitude IS NULL OR longitude IS NULL OR street_view_heading IS NULL
       LIMIT 100
     `;
 
@@ -796,34 +809,45 @@ app.post('/admin/geocode-properties', async (req, res) => {
     let geocoded = 0;
     let failed = 0;
 
-    // Geocode each property
     for (const prop of properties) {
       try {
-        const geocodeResult = await geocodeAddress(prop.address, prop.city, prop.state, prop.zip_code);
-        
-        if (geocodeResult.success) {
-          await pool.query(
-            'UPDATE properties SET latitude = $1, longitude = $2 WHERE id = $3',
-            [geocodeResult.latitude, geocodeResult.longitude, prop.id]
-          );
-          geocoded++;
-        } else {
-          failed++;
+        let latitude = prop.latitude;
+        let longitude = prop.longitude;
+
+        // Only re-geocode (costs a Nominatim request) if coordinates are
+        // actually missing — otherwise just fill in the heading.
+        if (latitude == null || longitude == null) {
+          const geocodeResult = await geocodeAddress(prop.address, prop.city, prop.state, prop.zip_code);
+          if (geocodeResult.success) {
+            latitude = geocodeResult.latitude;
+            longitude = geocodeResult.longitude;
+          }
+          await delay(1100); // Respect Nominatim's 1 req/sec rate limit
         }
 
-        // Respect 1 req/sec rate limit
-        await delay(1100);
+        if (latitude == null || longitude == null) {
+          failed++;
+          continue;
+        }
+
+        const heading = prop.street_view_heading ?? await getStreetViewHeading(latitude, longitude);
+
+        await pool.query(
+          'UPDATE properties SET latitude = $1, longitude = $2, street_view_heading = $3 WHERE id = $4',
+          [latitude, longitude, heading, prop.id]
+        );
+        geocoded++;
       } catch (error) {
         console.error(`Failed to geocode property ${prop.id}:`, error);
         failed++;
       }
     }
 
-    // Count remaining properties without coordinates
+    // Count remaining properties still missing coordinates or a heading
     const remainingResult = await pool.query(`
       SELECT COUNT(*) as count
       FROM properties
-      WHERE latitude IS NULL OR longitude IS NULL
+      WHERE latitude IS NULL OR longitude IS NULL OR street_view_heading IS NULL
     `);
     const remaining = parseInt(remainingResult.rows[0].count);
 
