@@ -220,7 +220,16 @@ app.get('/geocode/suggestions', suggestionsLimiter, async (req, res) => {
     return res.json({ success: true, suggestions: [] });
   }
 
-  const suggestions = await geocodeFreeTextSuggestions(query, 4);
+  // The frontend fires one request per keystroke (debounced) and abandons
+  // all but the latest as the user keeps typing. Track that so a request
+  // that's already been abandoned skips its Nominatim call entirely once it
+  // reaches the front of the throttle queue, instead of occupying a slot
+  // nobody's waiting on — see throttled() in geocode.js for why this matters.
+  let clientDisconnected = false;
+  req.on('close', () => { clientDisconnected = true; });
+
+  const suggestions = await geocodeFreeTextSuggestions(query, 6, () => clientDisconnected);
+  if (clientDisconnected) return; // nothing to send to a closed connection
   res.json({ success: true, suggestions });
 });
 

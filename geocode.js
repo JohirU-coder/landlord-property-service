@@ -21,14 +21,25 @@ const NJ_NY_METRO_VIEWBOX = '-75.5,41.4,-73.5,40.3';
 const MIN_REQUEST_INTERVAL_MS = 1100;
 let requestQueue = Promise.resolve();
 
-function throttled(fn) {
+function throttled(fn, isAborted) {
   // The caller gets the result as soon as fn() actually resolves — the
   // spacing delay only needs to gate when the *next* queued call is allowed
   // to start, not pad the response time of this one. (An earlier version
   // awaited the delay before returning, which added ~1.1s to every single
-  // request even when nothing else was queued — that was the whole
-  // "autocomplete feels slow" bug.)
-  const resultPromise = requestQueue.then(fn);
+  // request even when nothing else was queued.)
+  //
+  // isAborted is checked right as this item's turn comes up, not when it was
+  // queued — live-as-you-type suggestions fire one request per keystroke,
+  // and the browser abandons all but the latest as the user keeps typing.
+  // Without this check, every abandoned request still occupies a queue slot
+  // and pays the full 1.1s spacing, so typing a few characters can pile up
+  // 5-10+ seconds of queued lookups nobody's waiting for anymore. Skipping
+  // the actual network call for already-abandoned requests keeps the queue
+  // moving at real typing speed instead.
+  const resultPromise = requestQueue.then(() => {
+    if (isAborted && isAborted()) return [];
+    return fn();
+  });
   requestQueue = resultPromise.then(
     () => delay(MIN_REQUEST_INTERVAL_MS),
     () => delay(MIN_REQUEST_INTERVAL_MS) // still wait even if fn() threw, and don't let the queue itself reject
@@ -36,7 +47,7 @@ function throttled(fn) {
   return resultPromise;
 }
 
-function nominatimSearchRaw(query, { bias = false, limit = 1 } = {}) {
+function nominatimSearchRaw(query, { bias = false, limit = 1 } = {}, isAborted) {
   return throttled(() => new Promise((resolve) => {
     const encodedQuery = encodeURIComponent(query);
     const viewboxParam = bias ? `&viewbox=${NJ_NY_METRO_VIEWBOX}` : '';
@@ -58,7 +69,7 @@ function nominatimSearchRaw(query, { bias = false, limit = 1 } = {}) {
       console.error('Geocoding error:', err);
       resolve([]);
     });
-  }));
+  }), isAborted);
 }
 
 async function nominatimSearch(query, options = {}) {
@@ -126,11 +137,12 @@ async function geocodeFreeText(query) {
 // of just the top match — used for live-as-you-type suggestions, backed by
 // the same accurate data used for the actual search (unlike Photon's
 // separate, sparser free index, which has real coverage gaps for some
-// addresses). Safe to call per-keystroke-ish now that requests are globally
-// throttled above; the caller should still debounce to keep volume sane.
-async function geocodeFreeTextSuggestions(query, limit = 4) {
+// addresses). isAborted (optional) lets the caller signal that nobody's
+// waiting for this anymore by the time it reaches the front of the queue —
+// see throttled() above for why that matters.
+async function geocodeFreeTextSuggestions(query, limit = 6, isAborted) {
   try {
-    const results = await nominatimSearchRaw(query, { bias: true, limit });
+    const results = await nominatimSearchRaw(query, { bias: true, limit }, isAborted);
     return results
       .map(toStructuredResult)
       .filter(r => r.hasHouseNumber); // only full addresses, not bare streets/cities
