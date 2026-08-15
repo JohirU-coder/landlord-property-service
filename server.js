@@ -5,7 +5,7 @@ const helmet = require('helmet');
 const Joi = require('joi');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
-const { geocodeAddress, geocodeFreeText, delay } = require('./geocode');
+const { geocodeAddress, geocodeFreeText, geocodeFreeTextSuggestions, delay } = require('./geocode');
 const { getStreetViewHeading } = require('./streetView');
 const rateLimit = require('express-rate-limit');
 
@@ -199,6 +199,29 @@ app.get('/geocode', geocodeLimiter, async (req, res) => {
 
   const streetViewHeading = await getStreetViewHeading(result.latitude, result.longitude);
   res.json({ success: true, ...result, street_view_heading: streetViewHeading });
+});
+
+// GET /geocode/suggestions - Live-as-you-type address suggestions (PUBLIC).
+// Backed by the same accurate Nominatim data used for the actual search,
+// unlike the frontend's primary autocomplete source (Photon), whose free
+// index has real coverage gaps for some addresses. Requests are globally
+// throttled to Nominatim's 1 req/sec limit inside geocode.js regardless of
+// how many people are typing at once, so this is safe to hit frequently —
+// the frontend should still debounce so results don't queue up needlessly.
+const suggestionsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 40,
+  message: { error: 'Too many requests', message: 'Please slow down and try again shortly' }
+});
+
+app.get('/geocode/suggestions', suggestionsLimiter, async (req, res) => {
+  const query = (req.query.q || '').trim();
+  if (!query || query.length < 2) {
+    return res.json({ success: true, suggestions: [] });
+  }
+
+  const suggestions = await geocodeFreeTextSuggestions(query, 4);
+  res.json({ success: true, suggestions });
 });
 
 // POST /properties/community - Find-or-create a minimal, unverified property

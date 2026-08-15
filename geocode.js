@@ -11,29 +11,72 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // same-named street in an unrelated state.
 const NJ_NY_METRO_VIEWBOX = '-75.5,41.4,-73.5,40.3';
 
-function nominatimSearch(query, { bias = false } = {}) {
-  const encodedQuery = encodeURIComponent(query);
-  const viewboxParam = bias ? `&viewbox=${NJ_NY_METRO_VIEWBOX}` : '';
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodedQuery}&format=json&limit=1&addressdetails=1${viewboxParam}`;
-  const options = { headers: { 'User-Agent': 'RentReviews-Platform/1.0' } };
+// Global serialization queue — ensures at most ~1 request/second reaches
+// Nominatim no matter how many callers ask at once (property creation,
+// search-address-preview, live suggestions, concurrent users, ...).
+// Required by Nominatim's usage policy; without this, enough simultaneous
+// traffic could get our server's IP rate-limited or banned, breaking
+// geocoding platform-wide. Callers just await normally — the queue makes
+// them wait their turn transparently, never rejects.
+const MIN_REQUEST_INTERVAL_MS = 1100;
+let requestQueue = Promise.resolve();
 
-  return new Promise((resolve) => {
+function throttled(fn) {
+  const run = requestQueue.then(async () => {
+    const result = await fn();
+    await delay(MIN_REQUEST_INTERVAL_MS);
+    return result;
+  });
+  requestQueue = run.catch(() => {}); // keep the chain alive even if fn() throws
+  return run;
+}
+
+function nominatimSearchRaw(query, { bias = false, limit = 1 } = {}) {
+  return throttled(() => new Promise((resolve) => {
+    const encodedQuery = encodeURIComponent(query);
+    const viewboxParam = bias ? `&viewbox=${NJ_NY_METRO_VIEWBOX}` : '';
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodedQuery}&format=json&limit=${limit}&addressdetails=1${viewboxParam}`;
+    const options = { headers: { 'User-Agent': 'RentReviews-Platform/1.0' } };
+
     https.get(url, options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
           const results = JSON.parse(data);
-          resolve(results && results.length > 0 ? results[0] : null);
+          resolve(Array.isArray(results) ? results : []);
         } catch (e) {
-          resolve(null);
+          resolve([]);
         }
       });
     }).on('error', (err) => {
       console.error('Geocoding error:', err);
-      resolve(null);
+      resolve([]);
     });
-  });
+  }));
+}
+
+async function nominatimSearch(query, options = {}) {
+  const results = await nominatimSearchRaw(query, { ...options, limit: 1 });
+  return results[0] || null;
+}
+
+function toStructuredResult(result) {
+  const addr = result.address || {};
+  const houseNumber = addr.house_number || '';
+  const road = addr.road || '';
+  const streetAddress = [houseNumber, road].filter(Boolean).join(' ') || result.display_name.split(',')[0];
+
+  return {
+    latitude: parseFloat(result.lat),
+    longitude: parseFloat(result.lon),
+    display_name: result.display_name,
+    address: streetAddress,
+    city: addr.city || addr.town || addr.village || addr.hamlet || '',
+    state: addr.state || '',
+    zip_code: addr.postcode || '',
+    hasHouseNumber: Boolean(houseNumber)
+  };
 }
 
 async function geocodeAddress(address, city, state, zipCode) {
@@ -67,25 +110,29 @@ async function geocodeFreeText(query) {
       return { success: false, reason: 'No results found' };
     }
 
-    const addr = result.address || {};
-    const houseNumber = addr.house_number || '';
-    const road = addr.road || '';
-    const streetAddress = [houseNumber, road].filter(Boolean).join(' ') || result.display_name.split(',')[0];
-
-    return {
-      success: true,
-      latitude: parseFloat(result.lat),
-      longitude: parseFloat(result.lon),
-      display_name: result.display_name,
-      address: streetAddress,
-      city: addr.city || addr.town || addr.village || addr.hamlet || '',
-      state: addr.state || '',
-      zip_code: addr.postcode || ''
-    };
+    return { success: true, ...toStructuredResult(result) };
   } catch (error) {
     console.error('Geocode error:', error);
     return { success: false, reason: error.message };
   }
 }
 
-module.exports = { geocodeAddress, geocodeFreeText, delay };
+// Same idea as geocodeFreeText but returns up to `limit` candidates instead
+// of just the top match — used for live-as-you-type suggestions, backed by
+// the same accurate data used for the actual search (unlike Photon's
+// separate, sparser free index, which has real coverage gaps for some
+// addresses). Safe to call per-keystroke-ish now that requests are globally
+// throttled above; the caller should still debounce to keep volume sane.
+async function geocodeFreeTextSuggestions(query, limit = 4) {
+  try {
+    const results = await nominatimSearchRaw(query, { bias: true, limit });
+    return results
+      .map(toStructuredResult)
+      .filter(r => r.hasHouseNumber); // only full addresses, not bare streets/cities
+  } catch (error) {
+    console.error('Geocode suggestions error:', error);
+    return [];
+  }
+}
+
+module.exports = { geocodeAddress, geocodeFreeText, geocodeFreeTextSuggestions, delay };
