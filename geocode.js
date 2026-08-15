@@ -22,13 +22,18 @@ const MIN_REQUEST_INTERVAL_MS = 1100;
 let requestQueue = Promise.resolve();
 
 function throttled(fn) {
-  const run = requestQueue.then(async () => {
-    const result = await fn();
-    await delay(MIN_REQUEST_INTERVAL_MS);
-    return result;
-  });
-  requestQueue = run.catch(() => {}); // keep the chain alive even if fn() throws
-  return run;
+  // The caller gets the result as soon as fn() actually resolves — the
+  // spacing delay only needs to gate when the *next* queued call is allowed
+  // to start, not pad the response time of this one. (An earlier version
+  // awaited the delay before returning, which added ~1.1s to every single
+  // request even when nothing else was queued — that was the whole
+  // "autocomplete feels slow" bug.)
+  const resultPromise = requestQueue.then(fn);
+  requestQueue = resultPromise.then(
+    () => delay(MIN_REQUEST_INTERVAL_MS),
+    () => delay(MIN_REQUEST_INTERVAL_MS) // still wait even if fn() threw, and don't let the queue itself reject
+  );
+  return resultPromise;
 }
 
 function nominatimSearchRaw(query, { bias = false, limit = 1 } = {}) {
