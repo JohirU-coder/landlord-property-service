@@ -31,20 +31,24 @@ function throttled(fn, isAborted) {
   // isAborted is checked right as this item's turn comes up, not when it was
   // queued — live-as-you-type suggestions fire one request per keystroke,
   // and the browser abandons all but the latest as the user keeps typing.
-  // Without this check, every abandoned request still occupies a queue slot
-  // and pays the full 1.1s spacing, so typing a few characters can pile up
-  // 5-10+ seconds of queued lookups nobody's waiting for anymore. Skipping
-  // the actual network call for already-abandoned requests keeps the queue
-  // moving at real typing speed instead.
-  const resultPromise = requestQueue.then(() => {
-    if (isAborted && isAborted()) return [];
-    return fn();
+  // Skipped items must NOT pay the MIN_REQUEST_INTERVAL_MS spacing delay —
+  // that delay exists only to space out real Nominatim calls. An earlier
+  // version applied it unconditionally, so a pile of abandoned requests
+  // still serialized at 1.1s each even though none of them hit the network,
+  // completely defeating the point of skipping them.
+  const turnPromise = requestQueue.then(() => {
+    if (isAborted && isAborted()) {
+      return { skipped: true, value: [] };
+    }
+    return fn().then(value => ({ skipped: false, value }));
   });
-  requestQueue = resultPromise.then(
-    () => delay(MIN_REQUEST_INTERVAL_MS),
+
+  requestQueue = turnPromise.then(
+    (result) => (result.skipped ? undefined : delay(MIN_REQUEST_INTERVAL_MS)),
     () => delay(MIN_REQUEST_INTERVAL_MS) // still wait even if fn() threw, and don't let the queue itself reject
   );
-  return resultPromise;
+
+  return turnPromise.then(result => result.value);
 }
 
 function nominatimSearchRaw(query, { bias = false, limit = 1 } = {}, isAborted) {
