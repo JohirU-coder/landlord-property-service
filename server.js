@@ -475,6 +475,10 @@ app.get('/properties/:id', async (req, res) => {
 
 // Validation schema for property search query parameters
 const searchPropertiesSchema = Joi.object({
+  // Free-text search across address/city/state/zip combined — lets a full
+  // address (from autocomplete) match an existing property even though no
+  // single column contains the whole string. See tokenized matching below.
+  q: Joi.string().trim().min(1).max(300),
   city: Joi.string().min(2).max(100),
   state: Joi.string().min(2).max(50),
   zip_code: Joi.string().pattern(/^\d{5}(-\d{4})?$/),
@@ -525,6 +529,7 @@ app.get('/properties', async (req, res) => {
     }
 
     const {
+      q,
       city,
       state,
       zip_code,
@@ -546,6 +551,21 @@ app.get('/properties', async (req, res) => {
     let whereConditions = [];
     let queryParams = [];
     let paramCount = 0;
+
+    // Free-text search: a full address string (e.g. "104 Coral Street,
+    // Miami, FL 33101" from autocomplete) won't match any single column, so
+    // split it into tokens and require each to appear somewhere across the
+    // combined address/city/state/zip text — order- and field-independent.
+    if (q) {
+      const tokens = q.split(/[\s,]+/).map(t => t.trim()).filter(Boolean);
+      for (const token of tokens) {
+        paramCount++;
+        whereConditions.push(`
+          (p.address || ' ' || p.city || ' ' || p.state || ' ' || p.zip_code) ILIKE $${paramCount}
+        `);
+        queryParams.push(`%${token}%`);
+      }
+    }
 
     // Add filters based on provided parameters
     if (city) {
@@ -761,6 +781,7 @@ app.get('/properties', async (req, res) => {
         has_previous: currentPage > 1
       },
       filters_applied: {
+        q,
         city,
         state,
         zip_code,
