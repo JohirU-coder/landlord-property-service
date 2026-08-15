@@ -3,9 +3,18 @@ const https = require('https');
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-function nominatimSearch(query) {
+// NJ/NY metro area (roughly NYC five boroughs + northern/central NJ + lower
+// Hudson Valley), as "left,top,right,bottom" (min_lon,max_lat,max_lon,min_lat).
+// Used as a soft ranking bias, not a hard filter — a query that clearly
+// resolves elsewhere still returns that result, this just stops ambiguous
+// queries (e.g. a bare street name with no city) from randomly matching a
+// same-named street in an unrelated state.
+const NJ_NY_METRO_VIEWBOX = '-75.5,41.4,-73.5,40.3';
+
+function nominatimSearch(query, { bias = false } = {}) {
   const encodedQuery = encodeURIComponent(query);
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodedQuery}&format=json&limit=1&addressdetails=1`;
+  const viewboxParam = bias ? `&viewbox=${NJ_NY_METRO_VIEWBOX}` : '';
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodedQuery}&format=json&limit=1&addressdetails=1${viewboxParam}`;
   const options = { headers: { 'User-Agent': 'RentReviews-Platform/1.0' } };
 
   return new Promise((resolve) => {
@@ -53,7 +62,7 @@ async function geocodeAddress(address, city, state, zipCode) {
 // state/zip_code fields without the user re-typing them.
 async function geocodeFreeText(query) {
   try {
-    const result = await nominatimSearch(query);
+    const result = await nominatimSearch(query, { bias: true });
     if (!result) {
       return { success: false, reason: 'No results found' };
     }
