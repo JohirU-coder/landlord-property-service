@@ -105,6 +105,15 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Gates schema-setup/admin endpoints -- matches auth-service's pattern.
+const requireAdminSecret = (req, res, next) => {
+  const secret = req.headers['x-admin-secret'];
+  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Forbidden', message: 'Admin access required' });
+  }
+  next();
+};
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
@@ -137,7 +146,7 @@ app.get('/test', (req, res) => {
   });
 });
 
-app.get('/setup-database', async (req, res) => {
+app.get('/setup-database', requireAdminSecret, async (req, res) => {
   try {
     // Create properties table with latitude/longitude
     await pool.query(`
@@ -836,7 +845,7 @@ app.get('/properties', async (req, res) => {
 });
 
 // POST /admin/geocode-properties - Backfill geocoding for properties without coordinates
-app.post('/admin/geocode-properties', async (req, res) => {
+app.post('/admin/geocode-properties', requireAdminSecret, async (req, res) => {
   try {
     const adminSecret = req.headers['admin-secret'] || req.body.admin_secret;
     
