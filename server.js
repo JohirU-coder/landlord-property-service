@@ -101,7 +101,12 @@ app.use(cors({
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  // Accept is spec-safelisted, so Chrome lets a preflight through without it
+  // being explicitly listed here -- Safari/WebKit is stricter and enforces
+  // it anyway, so a request sending an explicit Accept header (like
+  // add-property.html's POST /properties) fails CORS in Safari specifically
+  // while working fine in Chrome.
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
 }));
 app.use(express.json());
 
