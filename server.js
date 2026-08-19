@@ -248,6 +248,18 @@ app.get('/geocode/suggestions', suggestionsLimiter, async (req, res) => {
 // is letting renters review properties no landlord has listed.
 app.post('/properties/community', authenticateToken, communitySubmitLimiter, async (req, res) => {
   try {
+    // Re-check verification status live against the DB rather than trusting
+    // the JWT -- a token issued before email verification became required
+    // (or before this account got verified) would otherwise still work for
+    // the rest of its 7-day lifetime.
+    const verifiedCheck = await pool.query('SELECT email_verified FROM users WHERE id = $1', [req.user.id]);
+    if (verifiedCheck.rows.length === 0 || !verifiedCheck.rows[0].email_verified) {
+      return res.status(403).json({
+        error: 'Email not verified',
+        message: 'Please verify your email before submitting a property.'
+      });
+    }
+
     const { error, value } = communityPropertySchema.validate(req.body);
     if (error) {
       return res.status(400).json({
@@ -301,6 +313,18 @@ app.post('/properties/community', authenticateToken, communitySubmitLimiter, asy
 // POST /properties - Create a new property (requires landlord auth)
 app.post('/properties', authenticateToken, requireRole(['landlord']), async (req, res) => {
   try {
+    // Re-check verification status live against the DB rather than trusting
+    // the JWT -- a token issued before email verification became required
+    // (or before this account got verified) would otherwise still work for
+    // the rest of its 7-day lifetime.
+    const verifiedCheck = await pool.query('SELECT email_verified FROM users WHERE id = $1', [req.user.id]);
+    if (verifiedCheck.rows.length === 0 || !verifiedCheck.rows[0].email_verified) {
+      return res.status(403).json({
+        error: 'Email not verified',
+        message: 'Please verify your email before adding a property.'
+      });
+    }
+
     // Validate request body
     const { error, value } = createPropertySchema.validate(req.body);
     if (error) {
