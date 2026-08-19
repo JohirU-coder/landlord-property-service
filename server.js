@@ -97,13 +97,7 @@ app.use(cors({
     'http://127.0.0.1:5500',
     'http://localhost:3000',
     'https://rentreviews.net',
-    'https://www.rentreviews.net',
-    // Capacitor's default WebView origins -- iOS uses the custom
-    // 'capacitor' scheme, Android serves over 'https' at the bare
-    // 'localhost' host. Neither is a real internet host; both only ever
-    // originate from the wrapped mobile app.
-    'capacitor://localhost',
-    'https://localhost'
+    'https://www.rentreviews.net'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
