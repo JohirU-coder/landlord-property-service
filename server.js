@@ -561,7 +561,12 @@ const searchPropertiesSchema = Joi.object({
   min_sqft: Joi.number().integer().positive().max(50000),
   max_sqft: Joi.number().integer().positive().max(50000),
   landlord_verified: Joi.boolean(),
-  sort_by: Joi.string().valid('rent_asc', 'rent_desc', 'newest', 'oldest', 'sqft_asc', 'sqft_desc'),
+  // "Near me" search -- when both are present, results are filtered to
+  // properties with known coordinates and can be sorted by distance from
+  // this point (sort_by=distance).
+  lat: Joi.number().min(-90).max(90),
+  lng: Joi.number().min(-180).max(180),
+  sort_by: Joi.string().valid('rent_asc', 'rent_desc', 'newest', 'oldest', 'sqft_asc', 'sqft_desc', 'distance'),
   limit: Joi.number().integer().min(1).max(100).default(20),
   offset: Joi.number().integer().min(0).default(0)
 }).custom((value, helpers) => {
@@ -612,6 +617,8 @@ app.get('/properties', async (req, res) => {
       min_sqft,
       max_sqft,
       landlord_verified,
+      lat,
+      lng,
       sort_by = 'newest',
       limit = 20,
       offset = 0
@@ -621,6 +628,29 @@ app.get('/properties', async (req, res) => {
     let whereConditions = [];
     let queryParams = [];
     let paramCount = 0;
+
+    // "Near me" search -- Haversine distance in miles from (lat, lng).
+    // Placeholders get reused in both the SELECT list and (if sort_by is
+    // 'distance') the ORDER BY, so they're registered once here up front.
+    let distanceSelectExpr = 'NULL';
+    if (lat !== undefined && lng !== undefined) {
+      paramCount++;
+      const latParam = paramCount;
+      queryParams.push(lat);
+      paramCount++;
+      const lngParam = paramCount;
+      queryParams.push(lng);
+
+      whereConditions.push('p.latitude IS NOT NULL AND p.longitude IS NOT NULL');
+
+      distanceSelectExpr = `(3959 * acos(
+        LEAST(1, GREATEST(-1,
+          cos(radians($${latParam})) * cos(radians(p.latitude)) *
+          cos(radians(p.longitude) - radians($${lngParam})) +
+          sin(radians($${latParam})) * sin(radians(p.latitude))
+        ))
+      ))`;
+    }
 
     // Free-text search: a full address string (e.g. "104 Coral Street,
     // Miami, FL 33101" from autocomplete) won't match any single column, so
@@ -718,6 +748,13 @@ app.get('/properties', async (req, res) => {
     // Build ORDER BY clause
     let orderClause;
     switch (sort_by) {
+      case 'distance':
+        // Falls back to newest if requested without coordinates -- distance
+        // is meaningless without a point to measure from.
+        orderClause = (lat !== undefined && lng !== undefined)
+          ? 'ORDER BY distance_miles ASC NULLS LAST'
+          : 'ORDER BY p.created_at DESC';
+        break;
       case 'rent_asc':
         orderClause = 'ORDER BY p.rent_amount ASC NULLS LAST';
         break;
@@ -766,6 +803,7 @@ app.get('/properties', async (req, res) => {
         p.description,
         p.landlord_verified,
         p.created_at,
+        ${distanceSelectExpr} AS distance_miles,
         u.first_name as landlord_first_name,
         u.last_name as landlord_last_name,
         u.email as landlord_email,
@@ -823,6 +861,7 @@ app.get('/properties', async (req, res) => {
       description: property.description,
       landlord_verified: property.landlord_verified,
       created_at: property.created_at,
+      distance_miles: property.distance_miles != null ? Math.round(parseFloat(property.distance_miles) * 10) / 10 : null,
       landlord: {
         first_name: property.landlord_first_name,
         last_name: property.landlord_last_name,
@@ -860,6 +899,7 @@ app.get('/properties', async (req, res) => {
         bathrooms_range: min_bathrooms || max_bathrooms ? { min: min_bathrooms, max: max_bathrooms } : null,
         sqft_range: min_sqft || max_sqft ? { min: min_sqft, max: max_sqft } : null,
         landlord_verified,
+        near: lat !== undefined && lng !== undefined ? { lat, lng } : null,
         sort_by
       }
     });
