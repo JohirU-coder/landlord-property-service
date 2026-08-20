@@ -1,7 +1,90 @@
-// Geocoding helper using OpenStreetMap Nominatim (free, 1 req/sec rate limit)
+// Geocoding helper. Google's Geocoding API (commercial, accurate) is tried
+// first for the two "give me one authoritative answer" lookups (property
+// creation, address-preview); OpenStreetMap Nominatim (free, 1 req/sec rate
+// limit) is the fallback if Google's unconfigured/denied/down, and remains
+// the sole source for live-as-you-type suggestions, which are much
+// higher-volume and lower-stakes than an actual saved/shown address.
 const https = require('https');
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Same server-side key used for Street View -- just needs the Geocoding API
+// added to its enabled APIs (and, if the key has API restrictions, to that
+// allowlist too) in Google Cloud Console.
+const GOOGLE_GEOCODING_KEY = process.env.GOOGLE_STREETVIEW_SERVER_KEY;
+
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+function componentValue(components, type, useShortName = false) {
+  const match = components.find(c => c.types.includes(type));
+  if (!match) return '';
+  return useShortName ? match.short_name : match.long_name;
+}
+
+function toStructuredResultFromGoogle(result) {
+  const comps = result.address_components || [];
+  const houseNumber = componentValue(comps, 'street_number');
+  const road = componentValue(comps, 'route');
+  const streetAddress = [houseNumber, road].filter(Boolean).join(' ') || result.formatted_address.split(',')[0];
+
+  return {
+    latitude: result.geometry.location.lat,
+    longitude: result.geometry.location.lng,
+    display_name: result.formatted_address,
+    address: streetAddress,
+    city: componentValue(comps, 'locality') || componentValue(comps, 'sublocality') || componentValue(comps, 'postal_town') || componentValue(comps, 'administrative_area_level_3') || '',
+    state: componentValue(comps, 'administrative_area_level_1', true),
+    zip_code: componentValue(comps, 'postal_code', true),
+    hasHouseNumber: Boolean(houseNumber)
+  };
+}
+
+// Not throttled like Nominatim -- Google's Geocoding API is a standard
+// commercial API with its own much higher quota, no 1 req/sec policy to
+// respect. Returns null (never throws) on any failure so callers can fall
+// back to Nominatim transparently.
+async function googleGeocode(query) {
+  if (!GOOGLE_GEOCODING_KEY) return null;
+
+  try {
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&components=country:US&key=${GOOGLE_GEOCODING_KEY}`;
+    const data = await httpsGetJson(url);
+
+    if (data.status === 'ZERO_RESULTS') return null; // genuinely no match -- expected, not an error
+
+    if (data.status !== 'OK' || !data.results?.length) {
+      // REQUEST_DENIED (API not enabled/billing not set up), OVER_QUERY_LIMIT,
+      // INVALID_REQUEST, etc. -- a real problem, not "no results". Logged
+      // distinctly so a misconfigured/exhausted key doesn't silently look
+      // like every address just happens to fall back to Nominatim.
+      console.error('Google Geocoding API returned non-OK status:', data.status, data.error_message || '');
+      return null;
+    }
+
+    // Prefer a real, precise street-level match over a loose route/locality
+    // match if Google returned multiple candidates for an ambiguous query.
+    const best = data.results.find(r => r.types.includes('street_address') || r.types.includes('premise'))
+      || data.results[0];
+    return toStructuredResultFromGoogle(best);
+  } catch (error) {
+    console.warn('Google Geocoding request failed:', error.message);
+    return null;
+  }
+}
 
 // NJ/NY metro area (roughly NYC five boroughs + northern/central NJ + lower
 // Hudson Valley), as "left,top,right,bottom" (min_lon,max_lat,max_lon,min_lat).
@@ -100,8 +183,14 @@ function toStructuredResult(result) {
 }
 
 async function geocodeAddress(address, city, state, zipCode) {
+  const fullAddress = [address, city, state, zipCode].filter(Boolean).join(', ');
+
+  const googleResult = await googleGeocode(fullAddress);
+  if (googleResult) {
+    return { success: true, latitude: googleResult.latitude, longitude: googleResult.longitude };
+  }
+
   try {
-    const fullAddress = [address, city, state, zipCode].filter(Boolean).join(', ');
     const result = await nominatimSearch(fullAddress);
 
     if (!result) {
@@ -120,10 +209,16 @@ async function geocodeAddress(address, city, state, zipCode) {
 }
 
 // Free-text address lookup (e.g. "104 Coral Street, Miami, FL") — used when a
-// searched address isn't yet a property in our database. Returns Nominatim's
-// structured address components so the caller can populate address/city/
-// state/zip_code fields without the user re-typing them.
+// searched address isn't yet a property in our database. Returns structured
+// address components so the caller can populate address/city/state/zip_code
+// fields without the user re-typing them. Tries Google first (see
+// googleGeocode above for why) and falls back to Nominatim.
 async function geocodeFreeText(query) {
+  const googleResult = await googleGeocode(query);
+  if (googleResult) {
+    return { success: true, ...googleResult };
+  }
+
   try {
     const result = await nominatimSearch(query, { bias: true });
     if (!result) {
