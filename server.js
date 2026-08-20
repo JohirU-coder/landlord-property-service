@@ -629,27 +629,10 @@ app.get('/properties', async (req, res) => {
     let queryParams = [];
     let paramCount = 0;
 
-    // "Near me" search -- Haversine distance in miles from (lat, lng).
-    // Placeholders get reused in both the SELECT list and (if sort_by is
-    // 'distance') the ORDER BY, so they're registered once here up front.
-    let distanceSelectExpr = 'NULL';
     if (lat !== undefined && lng !== undefined) {
-      paramCount++;
-      const latParam = paramCount;
-      queryParams.push(lat);
-      paramCount++;
-      const lngParam = paramCount;
-      queryParams.push(lng);
-
+      // No placeholders needed -- shared by both the search and count
+      // queries, unlike the distance values themselves (see below).
       whereConditions.push('p.latitude IS NOT NULL AND p.longitude IS NOT NULL');
-
-      distanceSelectExpr = `(3959 * acos(
-        LEAST(1, GREATEST(-1,
-          cos(radians($${latParam})) * cos(radians(p.latitude)) *
-          cos(radians(p.longitude) - radians($${lngParam})) +
-          sin(radians($${latParam})) * sin(radians(p.latitude))
-        ))
-      ))`;
     }
 
     // Free-text search: a full address string (e.g. "104 Coral Street,
@@ -740,8 +723,37 @@ app.get('/properties', async (req, res) => {
       queryParams.push(landlord_verified);
     }
 
+    // Every param up to here is referenced somewhere in whereConditions, so
+    // the count query (which shares whereClause but has no SELECT list of
+    // its own) needs exactly this many -- snapshot it before adding params
+    // that are only used in the search query's SELECT/ORDER BY/LIMIT.
+    const whereParamCount = paramCount;
+
+    // "Near me" search -- Haversine distance in miles from (lat, lng). Only
+    // used in the SELECT list (and ORDER BY, for sort_by=distance), never in
+    // whereConditions, so these placeholders must come after whereParamCount
+    // above or the count query ends up with unreferenced extra params and
+    // Postgres rejects the whole query.
+    let distanceSelectExpr = 'NULL';
+    if (lat !== undefined && lng !== undefined) {
+      paramCount++;
+      const latParam = paramCount;
+      queryParams.push(lat);
+      paramCount++;
+      const lngParam = paramCount;
+      queryParams.push(lng);
+
+      distanceSelectExpr = `(3959 * acos(
+        LEAST(1, GREATEST(-1,
+          cos(radians($${latParam})) * cos(radians(p.latitude)) *
+          cos(radians(p.longitude) - radians($${lngParam})) +
+          sin(radians($${latParam})) * sin(radians(p.latitude))
+        ))
+      ))`;
+    }
+
     // Build WHERE clause
-    const whereClause = whereConditions.length > 0 
+    const whereClause = whereConditions.length > 0
       ? `WHERE ${whereConditions.join(' AND ')}`
       : '';
 
@@ -836,7 +848,7 @@ app.get('/properties', async (req, res) => {
     // Execute both queries
     const [searchResult, countResult] = await Promise.all([
       pool.query(searchQuery, queryParams),
-      pool.query(countQuery, queryParams.slice(0, -2)) // Remove limit and offset for count
+      pool.query(countQuery, queryParams.slice(0, whereParamCount)) // Only the params whereClause actually references
     ]);
 
     const properties = searchResult.rows;
