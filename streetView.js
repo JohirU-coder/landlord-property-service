@@ -41,18 +41,47 @@ function bearingBetween(lat1, lng1, lat2, lng2) {
   return (toDeg(Math.atan2(y, x)) + 360) % 360;
 }
 
-// Returns the heading in degrees, or null if there's no Street View coverage
-// nearby, the lookup fails, or the server-side key isn't configured.
+// How far from the target point to look for a real panorama. Google's own
+// default is a tight 50m, which misses plenty of genuinely-covered suburban
+// addresses -- a house set back on a cul-de-sac or long driveway can easily
+// have its nearest panorama 100-150m away on the actual public road. 200m
+// catches those without wandering far enough to snap to an unrelated street.
+const SEARCH_RADIUS_METERS = 200;
+
+// Returns { heading, lat, lng } for the nearest real panorama (heading faces
+// from that panorama toward the target point), or null if there's no Street
+// View coverage nearby, the lookup fails, or the server-side key isn't
+// configured. lat/lng are the panorama's own coordinates, NOT the target's --
+// callers should request the Static/Embed image AT the panorama's coordinates
+// rather than the original target point. Google's Static/Embed APIs do their
+// own independent (and similarly tight, default-50m) nearest-panorama snap,
+// so if we told them to look at the original target point instead, a
+// panorama our own wider-radius metadata search found could still fail to
+// render there -- Google returns a "no imagery" placeholder as a normal 200
+// response, so that failure wouldn't even surface as an error.
 async function getStreetViewHeading(lat, lng) {
   if (!STREETVIEW_SERVER_KEY || lat == null || lng == null) return null;
 
   try {
-    const url = `https://maps.googleapis.com/maps/api/streetview/metadata?location=${lat},${lng}&key=${STREETVIEW_SERVER_KEY}`;
+    const url = `https://maps.googleapis.com/maps/api/streetview/metadata?location=${lat},${lng}&radius=${SEARCH_RADIUS_METERS}&key=${STREETVIEW_SERVER_KEY}`;
     const metadata = await httpsGetJson(url);
 
-    if (metadata.status !== 'OK' || !metadata.location) return null;
+    if (metadata.status === 'ZERO_RESULTS') return null; // genuinely no coverage nearby -- expected, not an error
 
-    return Math.round(bearingBetween(metadata.location.lat, metadata.location.lng, lat, lng));
+    if (metadata.status !== 'OK' || !metadata.location) {
+      // Anything else (REQUEST_DENIED, OVER_QUERY_LIMIT, INVALID_REQUEST,
+      // UNKNOWN_ERROR) is a real problem -- a bad/restricted key or an
+      // exhausted quota would otherwise silently look identical to "no
+      // coverage" everywhere, site-wide, with nothing in the logs to catch it.
+      console.error('Street View metadata returned non-OK status:', metadata.status, metadata.error_message || '');
+      return null;
+    }
+
+    return {
+      heading: Math.round(bearingBetween(metadata.location.lat, metadata.location.lng, lat, lng)),
+      lat: metadata.location.lat,
+      lng: metadata.location.lng
+    };
   } catch (error) {
     console.warn('Street View metadata lookup failed:', error.message);
     return null;

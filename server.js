@@ -180,7 +180,9 @@ app.get('/setup-database', requireAdminSecret, async (req, res) => {
       ALTER TABLE properties
       ADD COLUMN IF NOT EXISTS latitude DECIMAL(10, 8),
       ADD COLUMN IF NOT EXISTS longitude DECIMAL(11, 8),
-      ADD COLUMN IF NOT EXISTS street_view_heading DOUBLE PRECISION;
+      ADD COLUMN IF NOT EXISTS street_view_heading DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS street_view_lat DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS street_view_lng DOUBLE PRECISION;
     `);
     
     res.json({ 
@@ -211,8 +213,14 @@ app.get('/geocode', geocodeLimiter, async (req, res) => {
     return res.status(404).json({ error: 'Not found', message: 'Could not find that address' });
   }
 
-  const streetViewHeading = await getStreetViewHeading(result.latitude, result.longitude);
-  res.json({ success: true, ...result, street_view_heading: streetViewHeading });
+  const streetView = await getStreetViewHeading(result.latitude, result.longitude);
+  res.json({
+    success: true,
+    ...result,
+    street_view_heading: streetView?.heading ?? null,
+    street_view_lat: streetView?.lat ?? null,
+    street_view_lng: streetView?.lng ?? null
+  });
 });
 
 // GET /geocode/suggestions - Live-as-you-type address suggestions (PUBLIC).
@@ -289,22 +297,27 @@ app.post('/properties/community', authenticateToken, communitySubmitLimiter, asy
     let latitude = null;
     let longitude = null;
     let streetViewHeading = null;
+    let streetViewLat = null;
+    let streetViewLng = null;
     try {
       const geocodeResult = await geocodeAddress(address, city, state, zip_code);
       if (geocodeResult.success) {
         latitude = geocodeResult.latitude;
         longitude = geocodeResult.longitude;
-        streetViewHeading = await getStreetViewHeading(latitude, longitude);
+        const streetView = await getStreetViewHeading(latitude, longitude);
+        streetViewHeading = streetView?.heading ?? null;
+        streetViewLat = streetView?.lat ?? null;
+        streetViewLng = streetView?.lng ?? null;
       }
     } catch (geocodeErr) {
       console.warn('Geocoding failed for community property, continuing without coords:', geocodeErr);
     }
 
     const result = await pool.query(
-      `INSERT INTO properties (address, city, state, zip_code, latitude, longitude, street_view_heading, landlord_id, description)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)
+      `INSERT INTO properties (address, city, state, zip_code, latitude, longitude, street_view_heading, street_view_lat, street_view_lng, landlord_id, description)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10)
        RETURNING *`,
-      [address, city, state, zip_code, latitude, longitude, streetViewHeading,
+      [address, city, state, zip_code, latitude, longitude, streetViewHeading, streetViewLat, streetViewLng,
         '[Community-Submitted Property - Unverified by Landlord]']
     );
 
@@ -392,12 +405,17 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
     let latitude = null;
     let longitude = null;
     let streetViewHeading = null;
+    let streetViewLat = null;
+    let streetViewLng = null;
     try {
       const geocodeResult = await geocodeAddress(address, city, state, zip_code);
       if (geocodeResult.success) {
         latitude = geocodeResult.latitude;
         longitude = geocodeResult.longitude;
-        streetViewHeading = await getStreetViewHeading(latitude, longitude);
+        const streetView = await getStreetViewHeading(latitude, longitude);
+        streetViewHeading = streetView?.heading ?? null;
+        streetViewLat = streetView?.lat ?? null;
+        streetViewLng = streetView?.lng ?? null;
       }
     } catch (geocodeErr) {
       console.warn('Geocoding failed for property, continuing without coords:', geocodeErr);
@@ -406,9 +424,9 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
     // Insert the new property
     const insertQuery = `
       INSERT INTO properties (
-        address, city, state, zip_code, latitude, longitude, street_view_heading, rent_amount,
+        address, city, state, zip_code, latitude, longitude, street_view_heading, street_view_lat, street_view_lng, rent_amount,
         bedrooms, bathrooms, square_feet, description, landlord_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
       RETURNING *
     `;
 
@@ -420,6 +438,8 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
       latitude,
       longitude,
       streetViewHeading,
+      streetViewLat,
+      streetViewLng,
       rent_amount,
       bedrooms,
       bathrooms,
@@ -443,6 +463,8 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
         latitude: newProperty.latitude,
         longitude: newProperty.longitude,
         street_view_heading: newProperty.street_view_heading,
+        street_view_lat: newProperty.street_view_lat,
+        street_view_lng: newProperty.street_view_lng,
         rent_amount: newProperty.rent_amount,
         bedrooms: newProperty.bedrooms,
         bathrooms: newProperty.bathrooms,
@@ -518,6 +540,8 @@ app.get('/properties/:id', async (req, res) => {
         latitude: property.latitude,
         longitude: property.longitude,
         street_view_heading: property.street_view_heading,
+        street_view_lat: property.street_view_lat,
+        street_view_lng: property.street_view_lng,
         rent_amount: property.rent_amount,
         bedrooms: property.bedrooms,
         bathrooms: property.bathrooms,
@@ -808,6 +832,8 @@ app.get('/properties', async (req, res) => {
         p.latitude,
         p.longitude,
         p.street_view_heading,
+        p.street_view_lat,
+        p.street_view_lng,
         p.rent_amount,
         p.bedrooms,
         p.bathrooms,
@@ -866,6 +892,8 @@ app.get('/properties', async (req, res) => {
       latitude: property.latitude,
       longitude: property.longitude,
       street_view_heading: property.street_view_heading,
+      street_view_lat: property.street_view_lat,
+      street_view_lng: property.street_view_lng,
       rent_amount: property.rent_amount,
       bedrooms: property.bedrooms,
       bathrooms: property.bathrooms,
@@ -937,12 +965,18 @@ app.post('/admin/geocode-properties', requireAdminSecret, async (req, res) => {
       });
     }
 
-    // Get properties missing coordinates and/or a Street View heading
+    // Get properties missing coordinates, a Street View heading, or (for
+    // properties that already have a heading from before panorama
+    // coordinates were tracked) the panorama's own lat/lng -- those older
+    // rows still point their Static/Embed image requests at the raw
+    // property coordinates instead of the confirmed panorama, which is
+    // exactly the mismatch that could silently render as "no imagery".
     // (limit 100 per request)
     const query = `
-      SELECT id, address, city, state, zip_code, latitude, longitude, street_view_heading
+      SELECT id, address, city, state, zip_code, latitude, longitude, street_view_heading, street_view_lat, street_view_lng
       FROM properties
       WHERE latitude IS NULL OR longitude IS NULL OR street_view_heading IS NULL
+         OR (street_view_heading IS NOT NULL AND street_view_lat IS NULL)
       LIMIT 100
     `;
 
@@ -973,11 +1007,14 @@ app.post('/admin/geocode-properties', requireAdminSecret, async (req, res) => {
           continue;
         }
 
-        const heading = prop.street_view_heading ?? await getStreetViewHeading(latitude, longitude);
+        const streetView = await getStreetViewHeading(latitude, longitude);
+        const heading = streetView?.heading ?? null;
+        const streetViewLat = streetView?.lat ?? null;
+        const streetViewLng = streetView?.lng ?? null;
 
         await pool.query(
-          'UPDATE properties SET latitude = $1, longitude = $2, street_view_heading = $3 WHERE id = $4',
-          [latitude, longitude, heading, prop.id]
+          'UPDATE properties SET latitude = $1, longitude = $2, street_view_heading = $3, street_view_lat = $4, street_view_lng = $5 WHERE id = $6',
+          [latitude, longitude, heading, streetViewLat, streetViewLng, prop.id]
         );
         geocoded++;
       } catch (error) {
@@ -986,11 +1023,12 @@ app.post('/admin/geocode-properties', requireAdminSecret, async (req, res) => {
       }
     }
 
-    // Count remaining properties still missing coordinates or a heading
+    // Count remaining properties still missing coordinates, a heading, or panorama coords
     const remainingResult = await pool.query(`
       SELECT COUNT(*) as count
       FROM properties
       WHERE latitude IS NULL OR longitude IS NULL OR street_view_heading IS NULL
+         OR (street_view_heading IS NOT NULL AND street_view_lat IS NULL)
     `);
     const remaining = parseInt(remainingResult.rows[0].count);
 
