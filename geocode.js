@@ -178,7 +178,8 @@ function toStructuredResult(result) {
     city: addr.city || addr.town || addr.village || addr.hamlet || '',
     state: addr.state || '',
     zip_code: addr.postcode || '',
-    hasHouseNumber: Boolean(houseNumber)
+    hasHouseNumber: Boolean(houseNumber),
+    hasRoad: Boolean(road)
   };
 }
 
@@ -239,12 +240,24 @@ async function geocodeFreeText(query) {
 // addresses). isAborted (optional) lets the caller signal that nobody's
 // waiting for this anymore by the time it reaches the front of the queue —
 // see throttled() above for why that matters.
-async function geocodeFreeTextSuggestions(query, limit = 6, isAborted) {
+//
+// Only requires a real road/street component (hasRoad), not a house number
+// (hasHouseNumber) -- traced live against Nominatim for a real failing
+// search ("18 Liberty Street, Paterson, NJ"): neither Nominatim nor Photon
+// nor Google's own Geocoding API have house-number-level data for that
+// specific address, only the street itself. Requiring a house number here
+// used to throw away that one genuinely relevant result (right street,
+// right city) while still surfacing house-numbered matches on the same
+// street name in unrelated states -- backwards from what's useful. The
+// frontend ranks a hasHouseNumber:true match above a street-only one when
+// both are otherwise equally relevant, so precision isn't lost when it's
+// actually available.
+async function geocodeFreeTextSuggestions(query, limit = 8, isAborted) {
   try {
     const results = await nominatimSearchRaw(query, { bias: true, limit }, isAborted);
     return results
       .map(toStructuredResult)
-      .filter(r => r.hasHouseNumber); // only full addresses, not bare streets/cities
+      .filter(r => r.hasRoad); // still excludes bare city/state-only matches
   } catch (error) {
     console.error('Geocode suggestions error:', error);
     return [];

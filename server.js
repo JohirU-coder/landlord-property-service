@@ -253,7 +253,7 @@ app.get('/geocode/suggestions', suggestionsLimiter, async (req, res) => {
   let clientDisconnected = false;
   req.on('close', () => { clientDisconnected = true; });
 
-  const suggestions = await geocodeFreeTextSuggestions(query, 6, () => clientDisconnected);
+  const suggestions = await geocodeFreeTextSuggestions(query, 8, () => clientDisconnected);
   if (clientDisconnected) return; // nothing to send to a closed connection
   res.json({ success: true, suggestions });
 });
