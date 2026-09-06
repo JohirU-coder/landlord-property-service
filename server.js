@@ -138,6 +138,7 @@ app.get('/', (req, res) => {
       'setup-database': '/setup-database (GET)',
       'add-property': '/properties (POST)',
       'search-properties': '/properties (GET)',
+      'property-suggestions': '/properties/suggestions (GET)',
       'geocode-backfill': '/admin/geocode-properties (POST)',
       'normalize-states': '/admin/normalize-states (POST)',
       test: '/test'
@@ -255,6 +256,38 @@ app.get('/geocode/suggestions', suggestionsLimiter, async (req, res) => {
   const suggestions = await geocodeFreeTextSuggestions(query, 6, () => clientDisconnected);
   if (clientDisconnected) return; // nothing to send to a closed connection
   res.json({ success: true, suggestions });
+});
+
+// GET /properties/suggestions - Live-as-you-type suggestions sourced from
+// OUR OWN listed properties (PUBLIC). Both /geocode/suggestions and the
+// frontend's Photon calls only know about the general real-world address
+// universe -- neither has any idea what's actually listed here, so an
+// address that's already a property in this database had no fast,
+// guaranteed path into the autocomplete dropdown at all. This is a plain
+// local DB query (no external API, no rate-limit queue), so it's the
+// fastest of the three suggestion sources by a wide margin and always
+// accurate for what's actually listed -- the frontend gives it top
+// priority in the merged dropdown for exactly that reason.
+app.get('/properties/suggestions', async (req, res) => {
+  const query = (req.query.q || '').trim();
+  if (!query || query.length < 2) {
+    return res.json({ success: true, suggestions: [] });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id, address, city, state, zip_code, latitude, longitude, street_view_heading, street_view_lat, street_view_lng
+       FROM properties
+       WHERE (address || ' ' || city || ' ' || state || ' ' || zip_code) ILIKE '%' || $1 || '%'
+       ORDER BY created_at DESC
+       LIMIT 8`,
+      [query]
+    );
+    res.json({ success: true, suggestions: result.rows });
+  } catch (error) {
+    console.error('Error fetching property suggestions:', error);
+    res.json({ success: true, suggestions: [] }); // best-effort -- a failure here shouldn't break the other two sources
+  }
 });
 
 // POST /properties/community - Find-or-create a minimal, unverified property
