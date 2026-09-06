@@ -7,6 +7,7 @@ const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const { geocodeAddress, geocodeFreeText, geocodeFreeTextSuggestions, delay } = require('./geocode');
 const { getStreetViewHeading } = require('./streetView');
+const { normalizeState } = require('./stateNormalize');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -138,6 +139,7 @@ app.get('/', (req, res) => {
       'add-property': '/properties (POST)',
       'search-properties': '/properties (GET)',
       'geocode-backfill': '/admin/geocode-properties (POST)',
+      'normalize-states': '/admin/normalize-states (POST)',
       test: '/test'
     }
   });
@@ -281,7 +283,12 @@ app.post('/properties/community', authenticateToken, communitySubmitLimiter, asy
       });
     }
 
-    const { address, city, state, zip_code } = value;
+    const { address, city, zip_code } = value;
+    // Community-submitted addresses come from the geocoder, which can return
+    // either a full state name (Nominatim) or an abbreviation (Google)
+    // depending on which one answered -- normalize so every property is
+    // findable the same way regardless of source. See stateNormalize.js.
+    const state = normalizeState(value.state);
 
     // Idempotent: if this address already exists (landlord-listed or
     // previously community-submitted), just return it instead of duplicating.
@@ -355,7 +362,6 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
     const {
       address,
       city,
-      state,
       zip_code,
       rent_amount,
       bedrooms,
@@ -363,6 +369,10 @@ app.post('/properties', authenticateToken, requireRole(['landlord']), async (req
       square_feet,
       description
     } = value;
+    // Defense-in-depth: the form's own <select> always sends a 2-letter
+    // code, but normalize here too in case this endpoint is ever hit
+    // directly with a full state name. See stateNormalize.js.
+    const state = normalizeState(value.state);
 
     const landlord_id = req.user.id;
 
@@ -664,7 +674,15 @@ app.get('/properties', async (req, res) => {
     // split it into tokens and require each to appear somewhere across the
     // combined address/city/state/zip text — order- and field-independent.
     if (q) {
-      const tokens = q.split(/[\s,]+/).map(t => t.trim()).filter(Boolean);
+      // Strip a trailing period ("St." -> "St") and a leading "#" ("#4B" ->
+      // "4B") per token -- punctuation a person naturally types when
+      // abbreviating a street suffix or unit number, but that never
+      // actually appears in a stored address, so it would otherwise fail
+      // an exact-substring match against an address that's really a fine
+      // match.
+      const tokens = q.split(/[\s,]+/)
+        .map(t => t.trim().replace(/\.$/, '').replace(/^#/, ''))
+        .filter(Boolean);
       for (const token of tokens) {
         paramCount++;
         whereConditions.push(`
@@ -1047,6 +1065,41 @@ app.post('/admin/geocode-properties', requireAdminSecret, async (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Geocoding backfill failed',
+      details: error.message
+    });
+  }
+});
+
+// POST /admin/normalize-states - One-time backfill for properties saved
+// before state values were normalized to 2-letter codes. Community-submitted
+// properties in particular could have picked up a full state name (e.g.
+// "New Jersey") from Nominatim's geocoding response, which search's
+// substring matching would never match against someone searching "NJ".
+app.post('/admin/normalize-states', requireAdminSecret, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, state FROM properties');
+
+    let updated = 0;
+    for (const prop of result.rows) {
+      const normalized = normalizeState(prop.state);
+      if (normalized !== prop.state) {
+        await pool.query('UPDATE properties SET state = $1 WHERE id = $2', [normalized, prop.id]);
+        updated++;
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'State normalization complete',
+      checked: result.rows.length,
+      updated,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('State normalization error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'State normalization failed',
       details: error.message
     });
   }
