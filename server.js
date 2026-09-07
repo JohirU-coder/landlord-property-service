@@ -268,6 +268,69 @@ app.get('/geocode/suggestions', suggestionsLimiter, async (req, res) => {
 // fastest of the three suggestion sources by a wide margin and always
 // accurate for what's actually listed -- the frontend gives it top
 // priority in the merged dropdown for exactly that reason.
+//
+// GET /properties/stats is defined here too (before /properties/:id below)
+// for the same reason: Express matches routes in registration order, and
+// /properties/:id would otherwise catch a request for "/properties/stats"
+// first, try to parse "stats" as a numeric ID, and fail with "Invalid
+// property ID" -- which is exactly what was happening here until this was
+// moved (found while wiring the homepage's live stats display up to this
+// endpoint for the first time; it had apparently never been reachable).
+app.get('/properties/stats', async (req, res) => {
+  try {
+    const statsQuery = `
+      SELECT
+        COUNT(*) as total_properties,
+        COUNT(CASE WHEN landlord_verified = true THEN 1 END) as verified_properties,
+        AVG(rent_amount) as avg_rent,
+        MIN(rent_amount) as min_rent,
+        MAX(rent_amount) as max_rent,
+        AVG(bedrooms) as avg_bedrooms,
+        AVG(bathrooms) as avg_bathrooms,
+        AVG(square_feet) as avg_sqft,
+        COUNT(DISTINCT city) as cities_count,
+        COUNT(DISTINCT state) as states_count
+      FROM properties
+      WHERE rent_amount IS NOT NULL
+    `;
+
+    const result = await pool.query(statsQuery);
+    const stats = result.rows[0];
+
+    res.json({
+      success: true,
+      statistics: {
+        total_properties: parseInt(stats.total_properties),
+        verified_properties: parseInt(stats.verified_properties),
+        verification_rate: stats.total_properties > 0
+          ? Math.round((stats.verified_properties / stats.total_properties) * 100)
+          : 0,
+        rent_statistics: {
+          average: stats.avg_rent ? Math.round(parseFloat(stats.avg_rent)) : null,
+          minimum: stats.min_rent ? parseFloat(stats.min_rent) : null,
+          maximum: stats.max_rent ? parseFloat(stats.max_rent) : null
+        },
+        property_features: {
+          avg_bedrooms: stats.avg_bedrooms ? Math.round(parseFloat(stats.avg_bedrooms) * 10) / 10 : null,
+          avg_bathrooms: stats.avg_bathrooms ? Math.round(parseFloat(stats.avg_bathrooms) * 10) / 10 : null,
+          avg_square_feet: stats.avg_sqft ? Math.round(parseFloat(stats.avg_sqft)) : null
+        },
+        geographic_coverage: {
+          cities: parseInt(stats.cities_count),
+          states: parseInt(stats.states_count)
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching property statistics:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to fetch property statistics'
+    });
+  }
+});
+
 app.get('/properties/suggestions', async (req, res) => {
   const query = (req.query.q || '').trim();
   if (!query || query.length < 2) {
@@ -1139,61 +1202,6 @@ app.post('/admin/normalize-states', requireAdminSecret, async (req, res) => {
 });
 
 // GET /properties/stats - Get property statistics (bonus endpoint)
-app.get('/properties/stats', async (req, res) => {
-  try {
-    const statsQuery = `
-      SELECT 
-        COUNT(*) as total_properties,
-        COUNT(CASE WHEN landlord_verified = true THEN 1 END) as verified_properties,
-        AVG(rent_amount) as avg_rent,
-        MIN(rent_amount) as min_rent,
-        MAX(rent_amount) as max_rent,
-        AVG(bedrooms) as avg_bedrooms,
-        AVG(bathrooms) as avg_bathrooms,
-        AVG(square_feet) as avg_sqft,
-        COUNT(DISTINCT city) as cities_count,
-        COUNT(DISTINCT state) as states_count
-      FROM properties
-      WHERE rent_amount IS NOT NULL
-    `;
-
-    const result = await pool.query(statsQuery);
-    const stats = result.rows[0];
-
-    res.json({
-      success: true,
-      statistics: {
-        total_properties: parseInt(stats.total_properties),
-        verified_properties: parseInt(stats.verified_properties),
-        verification_rate: stats.total_properties > 0 
-          ? Math.round((stats.verified_properties / stats.total_properties) * 100) 
-          : 0,
-        rent_statistics: {
-          average: stats.avg_rent ? Math.round(parseFloat(stats.avg_rent)) : null,
-          minimum: stats.min_rent ? parseFloat(stats.min_rent) : null,
-          maximum: stats.max_rent ? parseFloat(stats.max_rent) : null
-        },
-        property_features: {
-          avg_bedrooms: stats.avg_bedrooms ? Math.round(parseFloat(stats.avg_bedrooms) * 10) / 10 : null,
-          avg_bathrooms: stats.avg_bathrooms ? Math.round(parseFloat(stats.avg_bathrooms) * 10) / 10 : null,
-          avg_square_feet: stats.avg_sqft ? Math.round(parseFloat(stats.avg_sqft)) : null
-        },
-        geographic_coverage: {
-          cities: parseInt(stats.cities_count),
-          states: parseInt(stats.states_count)
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching property statistics:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Failed to fetch property statistics'
-    });
-  }
-});
-
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🏠 Property service running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
