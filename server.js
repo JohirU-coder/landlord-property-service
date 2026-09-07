@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const { geocodeAddress, geocodeFreeText, geocodeFreeTextSuggestions, delay } = require('./geocode');
 const { getStreetViewHeading } = require('./streetView');
-const { normalizeState } = require('./stateNormalize');
+const { normalizeState, tokenizeAddressQuery, withStateCodeAlternate } = require('./stateNormalize');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -348,13 +348,18 @@ app.get('/properties/suggestions', async (req, res) => {
   }
 
   try {
+    // Matches the query as typed, and also with any full state name
+    // ("New Jersey") swapped for its stored code ("NJ") -- properties are
+    // always stored with the 2-letter code, so a query carrying the full
+    // name would otherwise never match. See stateNormalize.js.
     const result = await pool.query(
       `SELECT id, address, city, state, zip_code, latitude, longitude, street_view_heading, street_view_lat, street_view_lng
        FROM properties
        WHERE (address || ' ' || city || ' ' || state || ' ' || zip_code) ILIKE '%' || $1 || '%'
+          OR (address || ' ' || city || ' ' || state || ' ' || zip_code) ILIKE '%' || $2 || '%'
        ORDER BY created_at DESC
        LIMIT 8`,
-      [query]
+      [query, withStateCodeAlternate(query)]
     );
     res.json({ success: true, suggestions: result.rows });
   } catch (error) {
@@ -779,22 +784,35 @@ app.get('/properties', async (req, res) => {
     // Miami, FL 33101" from autocomplete) won't match any single column, so
     // split it into tokens and require each to appear somewhere across the
     // combined address/city/state/zip text — order- and field-independent.
+    // tokenizeAddressQuery also strips a trailing period ("St." -> "St")
+    // and a leading "#" ("#4B" -> "4B") per word -- punctuation a person
+    // naturally types when abbreviating a street suffix or unit number, but
+    // that never actually appears in a stored address, so it would
+    // otherwise fail an exact-substring match against an address that's
+    // really a fine match. It also recognizes a full state name ("New
+    // Jersey") as one unit and matches either that phrase or its stored
+    // 2-letter code, since requiring "New" AND "Jersey" to each separately
+    // appear would never match a state column that only ever holds "NJ".
     if (q) {
-      // Strip a trailing period ("St." -> "St") and a leading "#" ("#4B" ->
-      // "4B") per token -- punctuation a person naturally types when
-      // abbreviating a street suffix or unit number, but that never
-      // actually appears in a stored address, so it would otherwise fail
-      // an exact-substring match against an address that's really a fine
-      // match.
-      const tokens = q.split(/[\s,]+/)
-        .map(t => t.trim().replace(/\.$/, '').replace(/^#/, ''))
-        .filter(Boolean);
+      const tokens = tokenizeAddressQuery(q);
       for (const token of tokens) {
         paramCount++;
-        whereConditions.push(`
-          (p.address || ' ' || p.city || ' ' || p.state || ' ' || p.zip_code) ILIKE $${paramCount}
-        `);
-        queryParams.push(`%${token}%`);
+        if (token.altCode) {
+          const phraseParam = paramCount;
+          paramCount++;
+          const codeParam = paramCount;
+          whereConditions.push(`
+            ((p.address || ' ' || p.city || ' ' || p.state || ' ' || p.zip_code) ILIKE $${phraseParam}
+             OR p.state ILIKE $${codeParam})
+          `);
+          queryParams.push(`%${token.text}%`);
+          queryParams.push(token.altCode);
+        } else {
+          whereConditions.push(`
+            (p.address || ' ' || p.city || ' ' || p.state || ' ' || p.zip_code) ILIKE $${paramCount}
+          `);
+          queryParams.push(`%${token.text}%`);
+        }
       }
     }
 
@@ -808,7 +826,7 @@ app.get('/properties', async (req, res) => {
     if (state) {
       paramCount++;
       whereConditions.push(`LOWER(p.state) = LOWER($${paramCount})`);
-      queryParams.push(state);
+      queryParams.push(normalizeState(state));
     }
 
     if (zip_code) {
