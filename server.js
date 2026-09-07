@@ -278,6 +278,17 @@ app.get('/geocode/suggestions', suggestionsLimiter, async (req, res) => {
 // endpoint for the first time; it had apparently never been reachable).
 app.get('/properties/stats', async (req, res) => {
   try {
+    // No WHERE clause here on purpose -- this used to filter to
+    // rent_amount IS NOT NULL, which was meant to keep the rent
+    // average/min/max meaningful (aggregates like AVG/MIN/MAX already skip
+    // NULL rows on their own, so that filter was never actually needed for
+    // them) but had the side effect of also excluding those properties from
+    // total_properties, verified_properties, and the city/state counts --
+    // every community-submitted property (the /properties/community path,
+    // which never collects rent_amount) was invisible to this endpoint,
+    // undercounting the real total. Found immediately after fixing the
+    // route-ordering bug that had made this endpoint unreachable: it came
+    // back reporting 0 total properties despite 4 real ones existing.
     const statsQuery = `
       SELECT
         COUNT(*) as total_properties,
@@ -291,7 +302,6 @@ app.get('/properties/stats', async (req, res) => {
         COUNT(DISTINCT city) as cities_count,
         COUNT(DISTINCT state) as states_count
       FROM properties
-      WHERE rent_amount IS NOT NULL
     `;
 
     const result = await pool.query(statsQuery);
