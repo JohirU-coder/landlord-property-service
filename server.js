@@ -1001,16 +1001,30 @@ app.get('/properties', async (req, res) => {
       LEFT JOIN reviews r ON r.property_id = p.id
       ${whereClause}
       GROUP BY p.id, u.id
+      -- A community-submitted property (no landlord_id) with zero reviews is
+      -- just a stub created the moment someone started reviewing an address
+      -- and never finished -- it's not a real listing, so it shouldn't
+      -- clutter search/browse results. Once it has a review it's real
+      -- content and shows normally; a landlord-listed property always shows
+      -- regardless of review count, since that's a deliberate listing.
+      HAVING NOT (p.landlord_id IS NULL AND COUNT(r.id) = 0)
       ${orderClause}
       LIMIT ${limitParam} OFFSET ${offsetParam}
     `;
 
-    // Count query for pagination metadata
+    // Count query for pagination metadata -- mirrors the same review-backed
+    // filter as the main query above so the total/page count actually
+    // matches what gets returned.
     const countQuery = `
-      SELECT COUNT(*) as total
-      FROM properties p
-      LEFT JOIN users u ON p.landlord_id = u.id
-      ${whereClause}
+      SELECT COUNT(*) as total FROM (
+        SELECT p.id
+        FROM properties p
+        LEFT JOIN users u ON p.landlord_id = u.id
+        LEFT JOIN reviews r ON r.property_id = p.id
+        ${whereClause}
+        GROUP BY p.id
+        HAVING NOT (p.landlord_id IS NULL AND COUNT(r.id) = 0)
+      ) sub
     `;
 
     // Execute both queries
